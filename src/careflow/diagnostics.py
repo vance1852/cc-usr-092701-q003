@@ -41,6 +41,7 @@ class ConsistencyChecker:
     def run(self) -> dict[str, Any]:
         self.check_consent_dependencies()
         self.check_expiring_consents()
+        self.check_resign_pending()
         self.check_unreviewed_safety_flags()
         self.check_owner_access()
         self.check_patient_merge_targets()
@@ -88,6 +89,21 @@ class ConsistencyChecker:
                      {"patient_id": row["patient_id"], "kind": row["kind"], "consent_id": row["consent_id"],
                       "purpose": row["purpose"], "expires_at": row["expires_at"]},
                      "在授权到期前联系患者并确认后续安排；不能将提醒视作已续签。")
+
+    def check_resign_pending(self) -> None:
+        rows = self.connection.execute(
+            "SELECT c.id,c.patient_id,c.purpose,c.document_version,c.language,"
+            "(SELECT MAX(d.version) FROM consent_documents d "
+            "WHERE d.clinic_id=c.clinic_id AND d.purpose=c.purpose AND d.language=c.language) AS latest_version "
+            "FROM consents c WHERE c.clinic_id=? AND c.state='granted' AND EXISTS ("
+            "SELECT 1 FROM consent_documents d WHERE d.clinic_id=c.clinic_id AND d.purpose=c.purpose "
+            "AND d.language=c.language AND d.version>c.document_version AND d.requires_resign=1) ORDER BY c.id",
+            (self.clinic_id,)).fetchall()
+        for row in rows:
+            self.add("consent.resign_pending", "medium", "consent", row["id"],
+                     {"patient_id": row["patient_id"], "purpose": row["purpose"],
+                      "signed_version": row["document_version"], "latest_version": row["latest_version"]},
+                     "安排患者复诊时按最新版本重新签署知情同意书；旧签署原文仍保留可查。")
 
     def check_owner_access(self) -> None:
         owners = self.connection.execute(

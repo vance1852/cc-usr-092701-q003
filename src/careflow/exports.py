@@ -48,7 +48,7 @@ class PatientExportService:
                     raise Conflict("导出幂等编号已用于其他请求")
                 return {**decode_json(old["response_json"]), "replayed": True}
             consent = connection.execute(
-                "SELECT * FROM consents WHERE patient_id=? AND purpose='data_export' AND state='granted' ORDER BY revision DESC LIMIT 1",
+                "SELECT * FROM consents WHERE patient_id=? AND purpose='data_export' AND state='granted' ORDER BY rowid DESC LIMIT 1",
                 (patient_id,)).fetchone()
             if consent is None or (consent["expires_at"] and parsed_timestamp(consent["expires_at"]) <= parsed_timestamp(now)):
                 raise Conflict("患者没有当前有效的数据导出授权")
@@ -80,8 +80,24 @@ class PatientExportService:
                     "display_name": patient["display_name"], "birth_date": patient["birth_date"],
                     "state": patient["state"], "created_at": patient["created_at"]}
         if section == "consents":
-            rows = connection.execute("SELECT purpose,revision,text_digest,state,effective_at,expires_at,created_at FROM consents WHERE patient_id=? ORDER BY purpose,revision", (patient_id,)).fetchall()
-            return [dict(row) for row in rows]
+            # 联出签署对应的不可变文本版本，使导出能还原患者当时看到的原文。
+            rows = connection.execute(
+                "SELECT c.*,d.title AS doc_title,d.body AS doc_body,d.body_sha256 AS doc_sha256,"
+                "d.scope_json AS doc_scope,d.published_at AS doc_published_at "
+                "FROM consents c JOIN consent_documents d ON d.id=c.document_id "
+                "WHERE c.patient_id=? ORDER BY c.purpose,c.rowid", (patient_id,)).fetchall()
+            return [{"id": row["id"], "purpose": row["purpose"], "state": row["state"],
+                     "document_version": row["document_version"], "language": row["language"],
+                     "body_sha256": row["body_sha256"], "scope": decode_json(row["scope_json"]),
+                     "signed_at": row["signed_at"], "expires_at": row["expires_at"],
+                     "recorded_by": row["recorded_by"], "withdrawn_by": row["withdrawn_by"],
+                     "withdrawn_at": row["withdrawn_at"], "withdrawal_reason": row["withdrawal_reason"],
+                     "supersedes": row["supersedes"], "superseded_by": row["superseded_by"],
+                     "document": {"id": row["document_id"], "version": row["document_version"],
+                                  "language": row["language"], "title": row["doc_title"],
+                                  "body": row["doc_body"], "sha256": row["doc_sha256"],
+                                  "scope": decode_json(row["doc_scope"]),
+                                  "published_at": row["doc_published_at"]}} for row in rows]
         if section == "assessments":
             rows = connection.execute("SELECT id,kind,captured_at,captured_by,measurements_json,answers_json,source,status,signed_at,version FROM assessments WHERE patient_id=? ORDER BY captured_at,id", (patient_id,)).fetchall()
             return [{"id": row["id"], "kind": row["kind"], "captured_at": row["captured_at"],

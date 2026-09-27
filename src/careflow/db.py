@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import sqlite3
 import threading
@@ -10,8 +11,56 @@ from pathlib import Path
 from typing import Iterator
 
 from .errors import StorageFailure
+from .ids import new_id
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
+
+# 同意书文本版本：发布后不可变，只提供新增版本入口。
+CONSENT_DOCUMENTS_DDL = """
+CREATE TABLE IF NOT EXISTS consent_documents (
+    id TEXT PRIMARY KEY,
+    clinic_id TEXT NOT NULL REFERENCES clinics(id),
+    purpose TEXT NOT NULL,
+    version INTEGER NOT NULL,
+    language TEXT NOT NULL,
+    title TEXT NOT NULL,
+    body TEXT NOT NULL,
+    body_sha256 TEXT NOT NULL,
+    scope_json TEXT NOT NULL,
+    requires_resign INTEGER NOT NULL DEFAULT 0 CHECK(requires_resign IN (0,1)),
+    published_by TEXT NOT NULL REFERENCES staff(id),
+    published_at TEXT NOT NULL,
+    UNIQUE(clinic_id,purpose,language,version)
+);
+CREATE INDEX IF NOT EXISTS consent_documents_purpose ON consent_documents(clinic_id,purpose,language,version);
+"""
+
+# 患者签署记录：留存版本编号、语言、正文校验与签署时间；行版本号用于并发保护。
+CONSENTS_DDL = """
+CREATE TABLE IF NOT EXISTS consents (
+    id TEXT PRIMARY KEY,
+    patient_id TEXT NOT NULL REFERENCES patients(id),
+    clinic_id TEXT NOT NULL REFERENCES clinics(id),
+    purpose TEXT NOT NULL,
+    document_id TEXT NOT NULL REFERENCES consent_documents(id),
+    document_version INTEGER NOT NULL,
+    language TEXT NOT NULL,
+    body_sha256 TEXT NOT NULL,
+    scope_json TEXT NOT NULL,
+    state TEXT NOT NULL CHECK(state IN ('granted','withdrawn','superseded')),
+    signed_at TEXT NOT NULL,
+    expires_at TEXT,
+    recorded_by TEXT NOT NULL REFERENCES staff(id),
+    withdrawn_by TEXT REFERENCES staff(id),
+    withdrawn_at TEXT,
+    withdrawal_reason TEXT,
+    supersedes TEXT REFERENCES consents(id),
+    superseded_by TEXT REFERENCES consents(id),
+    version INTEGER NOT NULL DEFAULT 1,
+    created_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS consents_patient_purpose ON consents(patient_id,purpose,state);
+"""
 
 SCHEMA = """
 PRAGMA foreign_keys = ON;
@@ -68,21 +117,7 @@ CREATE TABLE IF NOT EXISTS patients (
     UNIQUE(clinic_id, external_ref)
 );
 CREATE INDEX IF NOT EXISTS patients_clinic_state ON patients(clinic_id,state,created_at);
-CREATE TABLE IF NOT EXISTS consents (
-    id TEXT PRIMARY KEY,
-    patient_id TEXT NOT NULL REFERENCES patients(id),
-    purpose TEXT NOT NULL,
-    revision INTEGER NOT NULL,
-    text_digest TEXT NOT NULL,
-    state TEXT NOT NULL CHECK(state IN ('granted','withdrawn','expired')),
-    effective_at TEXT NOT NULL,
-    expires_at TEXT,
-    recorded_by TEXT NOT NULL REFERENCES staff(id),
-    supersedes TEXT REFERENCES consents(id),
-    created_at TEXT NOT NULL,
-    UNIQUE(patient_id,purpose,revision)
-);
-CREATE INDEX IF NOT EXISTS consents_patient_purpose ON consents(patient_id,purpose,revision DESC);
+""" + CONSENT_DOCUMENTS_DDL + CONSENTS_DDL + """
 CREATE TABLE IF NOT EXISTS assessments (
     id TEXT PRIMARY KEY,
     patient_id TEXT NOT NULL REFERENCES patients(id),
@@ -399,6 +434,10 @@ class Database:
         try:
             with self.session() as connection:
                 connection.executescript(SCHEMA)
+                row = connection.execute("SELECT value FROM schema_meta WHERE key='schema_version'").fetchone()
+                stored = int(row[0]) if row else SCHEMA_VERSION
+                if stored < 2:
+                    self._migrate_consents_to_v2(connection)
                 connection.execute(
                     "INSERT INTO schema_meta(key,value) VALUES('schema_version',?) "
                     "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
@@ -406,6 +445,42 @@ class Database:
                 )
         except sqlite3.Error as exc:
             raise StorageFailure("数据库初始化失败", details={"reason": type(exc).__name__}) from exc
+
+    def _migrate_consents_to_v2(self, connection) -> None:
+        """v1 授权表只保存外部传入的摘要值。迁移后历史签署原样保留该摘要，
+        原文以占位文档明确标注未归档，不伪造当时文本。"""
+        legacy = connection.execute("SELECT * FROM consents").fetchall()
+        connection.execute("PRAGMA foreign_keys=OFF")
+        try:
+            connection.execute("ALTER TABLE consents RENAME TO consents_legacy_v1")
+            connection.execute("DROP INDEX IF EXISTS consents_patient_purpose")
+            connection.executescript(CONSENTS_DDL)
+            for row in legacy:
+                clinic_id = connection.execute(
+                    "SELECT clinic_id FROM patients WHERE id=?", (row["patient_id"],)).fetchone()["clinic_id"]
+                document_id = new_id("cnd")
+                placeholder = "（历史授权原文未数字化归档，仅保留签署时登记的文本摘要）"
+                connection.execute(
+                    "INSERT INTO consent_documents(id,clinic_id,purpose,version,language,title,body,body_sha256,scope_json,"
+                    "requires_resign,published_by,published_at) VALUES(?,?,?,?,?,?,?,?,?,0,?,?)",
+                    (document_id, clinic_id, row["purpose"], row["revision"], "und", "历史授权文本（迁移占位）",
+                     placeholder, hashlib.sha256(placeholder.encode("utf-8")).hexdigest(), "[]",
+                     row["recorded_by"], row["effective_at"]))
+                state = "superseded" if row["state"] == "expired" else row["state"]
+                connection.execute(
+                    "INSERT INTO consents(id,patient_id,clinic_id,purpose,document_id,document_version,language,body_sha256,"
+                    "scope_json,state,signed_at,expires_at,recorded_by,supersedes,created_at) "
+                    "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                    (row["id"], row["patient_id"], clinic_id, row["purpose"], document_id, row["revision"], "und",
+                     row["text_digest"], "[]", state, row["effective_at"], row["expires_at"], row["recorded_by"],
+                     row["supersedes"], row["created_at"]))
+            connection.execute(
+                "UPDATE consents SET superseded_by=(SELECT successor.id FROM consents successor "
+                "WHERE successor.supersedes=consents.id) "
+                "WHERE id IN (SELECT supersedes FROM consents WHERE supersedes IS NOT NULL)")
+            connection.execute("DROP TABLE consents_legacy_v1")
+        finally:
+            connection.execute("PRAGMA foreign_keys=ON")
 
     @contextmanager
     def transaction(self, *, write: bool = True) -> Iterator[sqlite3.Connection]:

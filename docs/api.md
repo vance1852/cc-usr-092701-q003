@@ -14,7 +14,10 @@
 - `GET /patients/{patient_id}` 返回最小档案，不返回联系方式密文。
 - `POST /patients/{patient_id}/merge` 以两个版本号和书面原因将重复档案标记为合并，并指向保留档案。
 - `POST /patients/{patient_id}/assessments` 新建评估草稿；`POST /assessments/{assessment_id}/sign` 由临床岗位签署。
-- `POST /patients/{patient_id}/consents` 创建更高版本的授权；`POST /consents/{consent_id}/withdraw` 撤回授权。
+- `POST /consent-documents` 由授权维护岗位按用途和语言发布不可变同意书文本版本，版本号在用途与语言内递增，正文 SHA-256 由服务端计算；已发布版本不能修改或删除。`GET /consent-documents` 按用途、语言列出版本元数据，`GET /consent-documents/{document_id}` 返回完整原文。发布时可标记 `requires_resign`，表示该版本生效后旧签署需要重新签署。
+- `POST /patients/{patient_id}/consents` 按已发布文本版本记录患者签署，留存版本编号、语言、正文校验与签署时间；`expected_current` 声明调用方看到的当前有效签署，并发签署时后到的请求会冲突而不会静默覆盖。`GET /patients/{patient_id}/consents` 查看签署历史。
+- `POST /consents/{consent_id}/withdraw` 撤回授权，可携带 `expected_version` 做版本校验；同一人员的重复撤回按幂等重放，其他人员的撤回不能覆盖在先决定。
+- `GET /patients/{patient_id}/consent-coverage?purpose=…&items=a,b` 在复诊时判断现有授权是否仍覆盖已提出的项目，状态为 `covered`、`missing`、`withdrawn`、`expired`、`resign_required`、`scope_expanded`（最新版本已扩大范围，需按新版本签署）或 `scope_uncovered`（无任何已发布版本覆盖）。
 - `POST /patients/{patient_id}/plans` 建立计划，医美和体重管理计划必须引用当前对应授权。
 - `POST /plans/{plan_id}/{propose|activate|pause|resume|complete|cancel}` 以 `expected_version` 执行带版本保护的状态转换。
 - `GET /patients/{patient_id}/weight-series` 返回按观察时间排序的测量值，不生成诊断或治疗建议。
@@ -41,10 +44,12 @@
 
 护理人员可报告事件或患者安全关注项；临床岗位复核并记录处置，诊所负责人可作废就诊记录。`GET /audit/verify` 校验诊所哈希链，`GET /audit/diagnostics` 汇报需人工核对的一致性问题，不自动修改业务状态。
 
-`POST /patients/{patient_id}/export` 只在存在有效数据导出授权时返回明确选择的章节。导出字段采用白名单，联系方式密文、凭据和内部合并字段不会导出；相同幂等请求得到相同内容摘要。`GET /reports/daily`、`appointments`、`incidents` 和 `overdue-milestones` 仅返回运营汇总或经岗位授权的工作队列。
+`POST /patients/{patient_id}/export` 只在存在有效数据导出授权时返回明确选择的章节。导出字段采用白名单，联系方式密文、凭据和内部合并字段不会导出；`consents` 章节会联出每次签署对应的文本版本原文，使导出能还原患者当时看到的内容；相同幂等请求得到相同内容摘要。`GET /reports/daily`、`appointments`、`incidents` 和 `overdue-milestones` 仅返回运营汇总或经岗位授权的工作队列。
 
 ## 主要状态
 
+- 同意书文本：按用途与语言递增的不可变版本，发布后不能改写。
+- 授权签署：有效 → 被取代或撤回；到期按签署时登记的到期时间判定。已执行的计划保留原授权依据，撤回只暂停尚未完成的关联计划。
 - 计划：草稿 → 提议 → 生效；可暂停和恢复，完成或取消后不能重新激活。
 - 预约：占位 → 确认 → 到诊 → 服务中 → 完成；取消和未到诊是独立终态。
 - 不良事件：已报告 → 分诊 → 观察 → 已解决 → 关闭。每次处置单独记录操作人和理由。

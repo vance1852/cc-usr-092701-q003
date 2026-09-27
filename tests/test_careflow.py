@@ -39,10 +39,15 @@ class CareflowCase(unittest.TestCase):
     def tearDown(self):
         self.temp.cleanup()
 
-    def consent(self, purpose="weight_program", revision=1, expires_at=None):
-        digest = hashlib.sha256(f"{purpose}-r{revision}".encode()).hexdigest()
-        return self.app.grant_consent(self.clinic, self.clinician, self.patient["id"], purpose,
-                                      revision, digest, expires_at=expires_at)
+    def publish(self, purpose="weight_program", language="zh-CN", body=None, scope=(), requires_resign=False):
+        return self.app.publish_consent_document(self.clinic, self.clinician, purpose, language,
+                                                 f"{purpose} 知情同意书", body or f"{purpose} 告知文本",
+                                                 list(scope), requires_resign=requires_resign)
+
+    def consent(self, purpose="weight_program", expires_at=None, scope=(), document=None):
+        doc = document or self.publish(purpose, scope=scope)
+        return self.app.grant_consent(self.clinic, self.clinician, self.patient["id"], doc["id"],
+                                      expires_at=expires_at)
 
     def plan(self, kind="weight"):
         consent = self.consent("weight_program" if kind == "weight" else "aesthetic_procedure")
@@ -72,8 +77,12 @@ class CareflowCase(unittest.TestCase):
         outsider = self.app.create_staff(other["id"], "负责人", "owner")
         with self.assertRaises(Unauthorized):
             self.app.get_patient(self.clinic, outsider["id"], self.patient["id"])
+        document = self.publish()
         with self.assertRaises(Forbidden):
-            self.app.grant_consent(self.clinic, self.coordinator, self.patient["id"], "weight_program", 1, "a" * 64)
+            self.app.grant_consent(self.clinic, self.coordinator, self.patient["id"], document["id"])
+        with self.assertRaises(Forbidden):
+            self.app.publish_consent_document(self.clinic, self.coordinator, "weight_program", "zh-CN",
+                                              "标题", "正文", [])
         self.assertNotIn("phone_ciphertext", self.app.get_patient(self.clinic, self.coordinator, self.patient["id"]))
 
     def test_withdrawal_preserves_consent_history_and_pauses_dependent_plan(self):
@@ -109,6 +118,132 @@ class CareflowCase(unittest.TestCase):
         with self.assertRaises(Conflict):
             self.app.create_plan(self.clinic, self.clinician, self.patient["id"], "weight", self.clinician,
                                  {"description": "目标"}, {}, "2026-09-27", consent_id=consent["id"])
+
+    def test_document_versions_are_immutable_and_signing_records_checksum(self):
+        first = self.publish(body="术后风险说明 第一版")
+        second = self.publish(body="术后风险说明 第二版", requires_resign=True)
+        self.assertEqual((first["version"], second["version"]), (1, 2))
+        consent = self.app.grant_consent(self.clinic, self.clinician, self.patient["id"], first["id"])
+        self.assertEqual(consent["body_sha256"], hashlib.sha256("术后风险说明 第一版".encode()).hexdigest())
+        self.assertEqual(consent["document_version"], 1)
+        self.assertEqual(consent["language"], "zh-CN")
+        self.assertEqual(consent["signed_at"], "2026-09-27T12:00:00Z")
+        stored = self.app.get_consent_document(self.clinic, self.clinician, first["id"])
+        self.assertEqual(stored["body"], "术后风险说明 第一版")
+        versions = self.app.list_consent_documents(self.clinic, self.clinician, purpose="weight_program")
+        self.assertEqual([row["version"] for row in versions], [1, 2])
+        self.assertNotIn("body", versions[0])
+
+    def test_new_text_does_not_rewrite_existing_signature(self):
+        first = self.publish(body="第一版")
+        consent = self.consent(document=first)
+        second = self.publish(body="第二版")
+        renewed = self.app.grant_consent(self.clinic, self.clinician, self.patient["id"], second["id"],
+                                         expected_current=consent["id"])
+        history = self.app.consent_history(self.clinic, self.clinician, self.patient["id"])
+        self.assertEqual([row["state"] for row in history], ["superseded", "granted"])
+        self.assertEqual(history[0]["body_sha256"], consent["body_sha256"])
+        self.assertEqual(history[0]["document_version"], 1)
+        self.assertEqual(history[0]["superseded_by"], renewed["id"])
+        self.assertEqual(history[1]["supersedes"], consent["id"])
+
+    def test_coverage_reports_clear_states(self):
+        result = self.app.check_consent_coverage(self.clinic, self.clinician, self.patient["id"], "weight_program")
+        self.assertEqual(result["status"], "missing")
+        doc = self.publish(scope=["nutrition", "medication"])
+        self.app.grant_consent(self.clinic, self.clinician, self.patient["id"], doc["id"])
+        result = self.app.check_consent_coverage(self.clinic, self.clinician, self.patient["id"],
+                                                 "weight_program", ["nutrition"])
+        self.assertEqual(result["status"], "covered")
+        self.publish(scope=["nutrition", "medication", "device"])
+        result = self.app.check_consent_coverage(self.clinic, self.clinician, self.patient["id"],
+                                                 "weight_program", ["nutrition", "device"])
+        self.assertEqual(result["status"], "scope_expanded")
+        self.assertEqual(result["uncovered_items"], ["device"])
+        self.assertEqual(result["latest_version"], 2)
+        result = self.app.check_consent_coverage(self.clinic, self.clinician, self.patient["id"],
+                                                 "weight_program", ["surgery"])
+        self.assertEqual(result["status"], "scope_uncovered")
+
+    def test_coverage_flags_resign_required_until_new_version_signed(self):
+        first = self.publish(body="风险说明 第一版")
+        consent = self.consent(document=first)
+        second = self.publish(body="风险说明 第二版", requires_resign=True)
+        result = self.app.check_consent_coverage(self.clinic, self.clinician, self.patient["id"], "weight_program")
+        self.assertEqual(result["status"], "resign_required")
+        self.assertEqual((result["signed_version"], result["latest_version"]), (1, 2))
+        self.app.grant_consent(self.clinic, self.clinician, self.patient["id"], second["id"],
+                               expected_current=consent["id"])
+        result = self.app.check_consent_coverage(self.clinic, self.clinician, self.patient["id"], "weight_program")
+        self.assertEqual(result["status"], "covered")
+
+    def test_coverage_flags_expired_and_withdrawn(self):
+        consent = self.consent(expires_at="2026-09-27T13:00:00Z")
+        self.clock.set(datetime(2026, 9, 27, 13, 1, tzinfo=UTC))
+        result = self.app.check_consent_coverage(self.clinic, self.clinician, self.patient["id"], "weight_program")
+        self.assertEqual(result["status"], "expired")
+        other = self.app.create_patient(self.clinic, self.coordinator, "case-018", "陈女士")
+        doc = self.publish()
+        granted = self.app.grant_consent(self.clinic, self.clinician, other["id"], doc["id"])
+        self.app.withdraw_consent(self.clinic, self.clinician, granted["id"], "患者撤回")
+        result = self.app.check_consent_coverage(self.clinic, self.clinician, other["id"], "weight_program")
+        self.assertEqual(result["status"], "withdrawn")
+        self.assertEqual(result["withdrawal_reason"], "患者撤回")
+
+    def test_concurrent_grant_and_withdraw_never_silently_overwrite(self):
+        first = self.publish(body="第一版")
+        consent = self.app.grant_consent(self.clinic, self.clinician, self.patient["id"], first["id"])
+        second = self.publish(body="第二版")
+        # 另一工作人员基于过期现状提交签署，必须冲突而不是覆盖在先决定。
+        with self.assertRaises(Conflict):
+            self.app.grant_consent(self.clinic, self.owner, self.patient["id"], second["id"])
+        renewed = self.app.grant_consent(self.clinic, self.owner, self.patient["id"], second["id"],
+                                         expected_current=consent["id"])
+        self.assertEqual(renewed["state"], "granted")
+        # 已被取代的签署不能再撤回。
+        with self.assertRaises(Conflict):
+            self.app.withdraw_consent(self.clinic, self.clinician, consent["id"], "迟到撤回")
+        # 版本号不匹配同样冲突。
+        with self.assertRaises(Conflict):
+            self.app.withdraw_consent(self.clinic, self.clinician, renewed["id"], "过期版本", expected_version=99)
+        self.app.withdraw_consent(self.clinic, self.clinician, renewed["id"], "患者撤回", expected_version=1)
+        # 另一人员的撤回不能覆盖在先撤回决定；同一人员重复请求按重放处理。
+        with self.assertRaises(Conflict):
+            self.app.withdraw_consent(self.clinic, self.owner, renewed["id"], "另一人员重复撤回")
+        replay = self.app.withdraw_consent(self.clinic, self.clinician, renewed["id"], "网络重试")
+        self.assertTrue(replay["replayed"])
+
+    def test_completed_plan_keeps_original_authorization_basis(self):
+        plan = self.plan()
+        self.app.transition_plan(self.clinic, self.clinician, plan["id"], 1, "propose")
+        self.app.transition_plan(self.clinic, self.clinician, plan["id"], 2, "activate")
+        self.app.transition_plan(self.clinic, self.clinician, plan["id"], 3, "complete")
+        consent = self.app.consent_history(self.clinic, self.clinician, self.patient["id"])[0]
+        self.app.withdraw_consent(self.clinic, self.clinician, consent["id"], "疗程结束后撤回")
+        history = self.app.plan_history(self.clinic, self.clinician, plan["id"])
+        self.assertEqual(history[-1]["snapshot"]["state"], "completed")
+        self.assertEqual(history[-1]["snapshot"]["consent_id"], consent["id"])
+
+    def test_export_restores_signed_document_text(self):
+        doc = self.publish("data_export", body="数据导出授权文本 第一版")
+        self.app.grant_consent(self.clinic, self.clinician, self.patient["id"], doc["id"])
+        self.publish("data_export", body="数据导出授权文本 第二版")
+        result = self.app.exports.export(self.clinic, self.owner, self.patient["id"], ["consents"],
+                                         "投诉核查", "export-text")
+        entry = result["data"]["consents"][0]
+        self.assertEqual(entry["document"]["body"], "数据导出授权文本 第一版")
+        self.assertEqual(entry["document"]["sha256"],
+                         hashlib.sha256("数据导出授权文本 第一版".encode()).hexdigest())
+        self.assertEqual(entry["body_sha256"], entry["document"]["sha256"])
+        self.assertEqual(entry["document_version"], 1)
+
+    def test_diagnostics_flags_pending_resign(self):
+        consent = self.consent()
+        self.publish(body="更新版风险说明", requires_resign=True)
+        report = self.app.run_diagnostics(self.clinic, self.owner)
+        self.assertIn("consent.resign_pending", {item["code"] for item in report["findings"]})
+        finding = next(item for item in report["findings"] if item["code"] == "consent.resign_pending")
+        self.assertEqual(finding["aggregate_id"], consent["id"])
 
     def test_appointment_hold_is_idempotent_and_expires_at_boundary(self):
         first = self.appointment()
