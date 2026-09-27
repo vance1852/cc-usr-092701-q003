@@ -80,8 +80,27 @@ class PatientExportService:
                     "display_name": patient["display_name"], "birth_date": patient["birth_date"],
                     "state": patient["state"], "created_at": patient["created_at"]}
         if section == "consents":
-            rows = connection.execute("SELECT purpose,revision,text_digest,state,effective_at,expires_at,created_at FROM consents WHERE patient_id=? ORDER BY purpose,revision", (patient_id,)).fetchall()
-            return [dict(row) for row in rows]
+            # 联查发布文本，导出即可还原患者当时看到的原文并复核校验值。
+            rows = connection.execute(
+                "SELECT c.purpose,c.revision,c.document_id,c.document_version,c.language,c.text_digest,c.covers_json,"
+                "c.state,c.signed_at,c.effective_at,c.expires_at,c.withdrawn_at,c.created_at,d.body "
+                "FROM consents c LEFT JOIN consent_documents d ON d.id=c.document_id "
+                "WHERE c.patient_id=? ORDER BY c.purpose,c.revision", (patient_id,)).fetchall()
+            items = []
+            for row in rows:
+                body = row["body"]
+                digest_verified = None
+                if body is not None:
+                    digest_verified = hashlib.sha256(body.encode("utf-8")).hexdigest() == row["text_digest"]
+                items.append({"purpose": row["purpose"], "revision": row["revision"],
+                              "document_id": row["document_id"], "document_version": row["document_version"],
+                              "language": row["language"], "text_digest": row["text_digest"],
+                              "covers": decode_json(row["covers_json"]) if row["covers_json"] else None,
+                              "state": row["state"], "signed_at": row["signed_at"],
+                              "effective_at": row["effective_at"], "expires_at": row["expires_at"],
+                              "withdrawn_at": row["withdrawn_at"], "created_at": row["created_at"],
+                              "body": body, "digest_verified": digest_verified})
+            return items
         if section == "assessments":
             rows = connection.execute("SELECT id,kind,captured_at,captured_by,measurements_json,answers_json,source,status,signed_at,version FROM assessments WHERE patient_id=? ORDER BY captured_at,id", (patient_id,)).fetchall()
             return [{"id": row["id"], "kind": row["kind"], "captured_at": row["captured_at"],

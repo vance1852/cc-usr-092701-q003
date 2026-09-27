@@ -14,12 +14,14 @@
 - `GET /patients/{patient_id}` 返回最小档案，不返回联系方式密文。
 - `POST /patients/{patient_id}/merge` 以两个版本号和书面原因将重复档案标记为合并，并指向保留档案。
 - `POST /patients/{patient_id}/assessments` 新建评估草稿；`POST /assessments/{assessment_id}/sign` 由临床岗位签署。
-- `POST /patients/{patient_id}/consents` 创建更高版本的授权；`POST /consents/{consent_id}/withdraw` 撤回授权。
+- `POST /consent-documents` 按用途与语言发布不可变同意书文本，版本必须递增，正文校验值由服务计算；发布后不能改写或删除，文案更新只能以更高版本重新发布。`GET /consent-documents` 列出版本，`GET /consent-documents/{document_id}` 返回正文并即时复核校验值。
+- `POST /patients/{patient_id}/consents` 按已发布文本签署授权，留存文本版本、语言、正文校验值与签署时间；`POST /consents/{consent_id}/withdraw` 撤回授权。`GET /patients/{patient_id}/consents` 查看授权历史。
+- `GET /patients/{patient_id}/consent-coverage?purpose=…&items=…` 在复诊时判断现有授权是否仍覆盖拟开展项目，状态为 `covered`、`scope_expanded`（范围扩大）、`resign_required`（新版本要求重新签署）、`expired`、`withdrawn` 或 `missing`。
 - `POST /patients/{patient_id}/plans` 建立计划，医美和体重管理计划必须引用当前对应授权。
 - `POST /plans/{plan_id}/{propose|activate|pause|resume|complete|cancel}` 以 `expected_version` 执行带版本保护的状态转换。
 - `GET /patients/{patient_id}/weight-series` 返回按观察时间排序的测量值，不生成诊断或治疗建议。
 
-评估签署后不可覆盖。就诊病历由章节组成，签署需要主诉、评估和计划三部分；签署后的补充内容成为新版本，原始文字仍保留。
+评估签署后不可覆盖。就诊病历由章节组成，签署需要主诉、评估和计划三部分；签署后的补充内容成为新版本，原始文字仍保留。文案更新不改写既有签署；并发签署或撤回以条件更新保护，先发生的决定不会被静默覆盖；已完成计划保留原授权依据，撤回只暂停尚未完成的关联计划。
 
 ## 预约、随访与计划节点
 
@@ -41,10 +43,11 @@
 
 护理人员可报告事件或患者安全关注项；临床岗位复核并记录处置，诊所负责人可作废就诊记录。`GET /audit/verify` 校验诊所哈希链，`GET /audit/diagnostics` 汇报需人工核对的一致性问题，不自动修改业务状态。
 
-`POST /patients/{patient_id}/export` 只在存在有效数据导出授权时返回明确选择的章节。导出字段采用白名单，联系方式密文、凭据和内部合并字段不会导出；相同幂等请求得到相同内容摘要。`GET /reports/daily`、`appointments`、`incidents` 和 `overdue-milestones` 仅返回运营汇总或经岗位授权的工作队列。
+`POST /patients/{patient_id}/export` 只在存在有效数据导出授权时返回明确选择的章节。导出字段采用白名单，联系方式密文、凭据和内部合并字段不会导出；授权章节包含签署对应的正文原文与校验复核结果，可还原患者当时看到的文本版本。相同幂等请求得到相同内容摘要。`GET /reports/daily`、`appointments`、`incidents` 和 `overdue-milestones` 仅返回运营汇总或经岗位授权的工作队列。
 
 ## 主要状态
 
+- 授权：有效 → 被重新签署取代（过期）或撤回；到期时间经过后按过期处理。授权覆盖判定另见 `consent-coverage`。
 - 计划：草稿 → 提议 → 生效；可暂停和恢复，完成或取消后不能重新激活。
 - 预约：占位 → 确认 → 到诊 → 服务中 → 完成；取消和未到诊是独立终态。
 - 不良事件：已报告 → 分诊 → 观察 → 已解决 → 关闭。每次处置单独记录操作人和理由。

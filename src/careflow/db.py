@@ -11,7 +11,7 @@ from typing import Iterator
 
 from .errors import StorageFailure
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 
 SCHEMA = """
 PRAGMA foreign_keys = ON;
@@ -68,6 +68,25 @@ CREATE TABLE IF NOT EXISTS patients (
     UNIQUE(clinic_id, external_ref)
 );
 CREATE INDEX IF NOT EXISTS patients_clinic_state ON patients(clinic_id,state,created_at);
+CREATE TABLE IF NOT EXISTS consent_documents (
+    id TEXT PRIMARY KEY,
+    clinic_id TEXT NOT NULL REFERENCES clinics(id),
+    purpose TEXT NOT NULL,
+    language TEXT NOT NULL,
+    version INTEGER NOT NULL,
+    body TEXT NOT NULL,
+    body_sha256 TEXT NOT NULL,
+    covers_json TEXT NOT NULL,
+    requires_resign INTEGER NOT NULL DEFAULT 0 CHECK(requires_resign IN (0,1)),
+    published_by TEXT NOT NULL REFERENCES staff(id),
+    published_at TEXT NOT NULL,
+    UNIQUE(clinic_id,purpose,language,version)
+);
+CREATE INDEX IF NOT EXISTS consent_documents_lookup ON consent_documents(clinic_id,purpose,language,version DESC);
+CREATE TRIGGER IF NOT EXISTS consent_documents_no_update BEFORE UPDATE ON consent_documents
+BEGIN SELECT RAISE(ABORT,'consent_documents 发布后不可改写'); END;
+CREATE TRIGGER IF NOT EXISTS consent_documents_no_delete BEFORE DELETE ON consent_documents
+BEGIN SELECT RAISE(ABORT,'consent_documents 发布后不可删除'); END;
 CREATE TABLE IF NOT EXISTS consents (
     id TEXT PRIMARY KEY,
     patient_id TEXT NOT NULL REFERENCES patients(id),
@@ -80,6 +99,12 @@ CREATE TABLE IF NOT EXISTS consents (
     recorded_by TEXT NOT NULL REFERENCES staff(id),
     supersedes TEXT REFERENCES consents(id),
     created_at TEXT NOT NULL,
+    document_id TEXT REFERENCES consent_documents(id),
+    document_version INTEGER,
+    language TEXT,
+    signed_at TEXT,
+    covers_json TEXT,
+    withdrawn_at TEXT,
     UNIQUE(patient_id,purpose,revision)
 );
 CREATE INDEX IF NOT EXISTS consents_patient_purpose ON consents(patient_id,purpose,revision DESC);
@@ -399,6 +424,7 @@ class Database:
         try:
             with self.session() as connection:
                 connection.executescript(SCHEMA)
+                self._migrate_consents(connection)
                 connection.execute(
                     "INSERT INTO schema_meta(key,value) VALUES('schema_version',?) "
                     "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
@@ -406,6 +432,22 @@ class Database:
                 )
         except sqlite3.Error as exc:
             raise StorageFailure("数据库初始化失败", details={"reason": type(exc).__name__}) from exc
+
+    @staticmethod
+    def _migrate_consents(connection: sqlite3.Connection) -> None:
+        """为既有数据库补齐授权原文追溯列；新库由建表语句直接包含这些列。"""
+        columns = {row[1] for row in connection.execute("PRAGMA table_info(consents)")}
+        additions = {
+            "document_id": "ALTER TABLE consents ADD COLUMN document_id TEXT REFERENCES consent_documents(id)",
+            "document_version": "ALTER TABLE consents ADD COLUMN document_version INTEGER",
+            "language": "ALTER TABLE consents ADD COLUMN language TEXT",
+            "signed_at": "ALTER TABLE consents ADD COLUMN signed_at TEXT",
+            "covers_json": "ALTER TABLE consents ADD COLUMN covers_json TEXT",
+            "withdrawn_at": "ALTER TABLE consents ADD COLUMN withdrawn_at TEXT",
+        }
+        for name, ddl in additions.items():
+            if name not in columns:
+                connection.execute(ddl)
 
     @contextmanager
     def transaction(self, *, write: bool = True) -> Iterator[sqlite3.Connection]:

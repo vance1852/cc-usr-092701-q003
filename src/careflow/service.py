@@ -4,7 +4,9 @@ from __future__ import annotations
 
 from datetime import timedelta
 import hashlib
+import re
 import secrets
+import sqlite3
 from typing import Any
 
 from . import audit
@@ -17,6 +19,7 @@ from .validation import (
     calendar_date,
     choice,
     decimal_value,
+    integer,
     object_value,
     parsed_timestamp,
     request_digest,
@@ -24,6 +27,24 @@ from .validation import (
     text,
     timestamp,
 )
+
+CONSENT_PURPOSES = {"clinical_care", "aesthetic_procedure", "weight_program", "followup_contact", "data_export"}
+
+_LANGUAGE = re.compile(r"[a-z]{2,3}(-[a-z0-9]{2,8})*")
+
+
+def normalize_language(value: Any) -> str:
+    """语言代码统一小写存储，避免同一语言出现多个版本线。"""
+    result = text(value, "语言代码", maximum=35).lower()
+    if not _LANGUAGE.fullmatch(result):
+        raise ValidationError("语言代码格式无效")
+    return result
+
+
+def normalize_items(value: Any, field: str) -> list[str]:
+    if not isinstance(value, list) or len(value) > 200:
+        raise ValidationError(f"{field}必须为不超过 200 项的列表")
+    return sorted({text(item, f"{field}条目", maximum=80) for item in value})
 
 
 class Careflow:
@@ -269,13 +290,107 @@ class Careflow:
                                                          "source_version": source["version"], "target_version": target["version"]})
         return {"source_id": source_id, "target_id": target_id, "state": "merged", "merged_at": now}
 
+    def publish_consent_document(self, clinic_id: str, actor_id: str, purpose: str, language: str,
+                                 version: int, body: str, covers: list[str] | None = None,
+                                 *, requires_resign: bool = False) -> dict[str, Any]:
+        """按用途与语言发布不可变同意书文本；文案更新只能以更高版本重新发布。"""
+        purpose = choice(purpose, "授权用途", CONSENT_PURPOSES)
+        language = normalize_language(language)
+        version = integer(version, "文本版本", minimum=1, maximum=10**6)
+        body = text(body, "同意书正文", maximum=20000, strip=False)
+        if not body.strip():
+            raise ValidationError("同意书正文不能为空")
+        if not isinstance(requires_resign, bool):
+            raise ValidationError("重新签署标记必须为布尔值")
+        items = normalize_items(covers or [], "覆盖项目")
+        digest = hashlib.sha256(body.encode("utf-8")).hexdigest()
+        document_id = new_id("cnd")
+        now = self.now()
+        with self.db.transaction() as connection:
+            authorize(principal_for(connection, actor_id, clinic_id), "consent:publish", clinic_id=clinic_id)
+            latest = connection.execute(
+                "SELECT MAX(version) FROM consent_documents WHERE clinic_id=? AND purpose=? AND language=?",
+                (clinic_id, purpose, language)).fetchone()[0]
+            if latest is not None and version <= latest:
+                raise Conflict("文本版本必须高于已发布版本", details={"latest_version": latest})
+            try:
+                connection.execute(
+                    "INSERT INTO consent_documents(id,clinic_id,purpose,language,version,body,body_sha256,covers_json,"
+                    "requires_resign,published_by,published_at) VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+                    (document_id, clinic_id, purpose, language, version, body, digest, encode_json(items),
+                     1 if requires_resign else 0, actor_id, now))
+            except sqlite3.IntegrityError as exc:
+                raise Conflict("该版本文本已被其他操作发布") from exc
+            audit.append_event(connection, clinic_id=clinic_id, actor_id=actor_id, patient_id=None,
+                               aggregate_type="consent_document", aggregate_id=document_id,
+                               action="consent_document.published", occurred_at=now,
+                               payload={"purpose": purpose, "language": language, "version": version,
+                                        "body_sha256": digest, "covers": items, "requires_resign": requires_resign})
+        return {"id": document_id, "clinic_id": clinic_id, "purpose": purpose, "language": language,
+                "version": version, "body_sha256": digest, "covers": items,
+                "requires_resign": requires_resign, "published_by": actor_id, "published_at": now}
+
+    @staticmethod
+    def _document_summary(row) -> dict[str, Any]:
+        return {"id": row["id"], "purpose": row["purpose"], "language": row["language"],
+                "version": row["version"], "body_sha256": row["body_sha256"],
+                "covers": decode_json(row["covers_json"]), "requires_resign": bool(row["requires_resign"]),
+                "published_by": row["published_by"], "published_at": row["published_at"]}
+
+    def list_consent_documents(self, clinic_id: str, actor_id: str, *, purpose: str | None = None,
+                               language: str | None = None) -> list[dict[str, Any]]:
+        with self.db.transaction(write=False) as connection:
+            authorize(principal_for(connection, actor_id, clinic_id), "consent:read", clinic_id=clinic_id)
+            clauses, params = ["clinic_id=?"], [clinic_id]
+            if purpose:
+                clauses.append("purpose=?")
+                params.append(choice(purpose, "授权用途", CONSENT_PURPOSES))
+            if language:
+                clauses.append("language=?")
+                params.append(normalize_language(language))
+            rows = connection.execute(
+                f"SELECT * FROM consent_documents WHERE {' AND '.join(clauses)} ORDER BY purpose,language,version",
+                params).fetchall()
+            return [self._document_summary(row) for row in rows]
+
+    def get_consent_document(self, clinic_id: str, actor_id: str, document_id: str) -> dict[str, Any]:
+        """返回文本原文并即时复核校验值，供投诉材料还原患者当时看到的版本。"""
+        with self.db.transaction(write=False) as connection:
+            authorize(principal_for(connection, actor_id, clinic_id), "consent:read", clinic_id=clinic_id)
+            row = connection.execute("SELECT * FROM consent_documents WHERE id=? AND clinic_id=?",
+                                     (document_id, clinic_id)).fetchone()
+            if row is None:
+                raise NotFound("同意书文本不存在")
+            result = self._document_summary(row)
+            result["body"] = row["body"]
+            result["integrity_ok"] = hashlib.sha256(row["body"].encode("utf-8")).hexdigest() == row["body_sha256"]
+            return result
+
+    @staticmethod
+    def _resolve_consent_document(connection, clinic_id: str, purpose: str,
+                                  document_id: str | None, language: str | None):
+        if document_id:
+            row = connection.execute("SELECT * FROM consent_documents WHERE id=? AND clinic_id=?",
+                                     (document_id, clinic_id)).fetchone()
+            if row is None:
+                raise NotFound("同意书文本不存在")
+            if row["purpose"] != purpose:
+                raise ValidationError("同意书文本用途与授权用途不一致")
+            return row
+        if not language:
+            raise ValidationError("需指定同意书文本编号或语言")
+        row = connection.execute(
+            "SELECT * FROM consent_documents WHERE clinic_id=? AND purpose=? AND language=? ORDER BY version DESC LIMIT 1",
+            (clinic_id, purpose, normalize_language(language))).fetchone()
+        if row is None:
+            raise NotFound("该用途与语言尚未发布同意书文本")
+        return row
+
     def grant_consent(self, clinic_id: str, actor_id: str, patient_id: str, purpose: str,
-                      revision: int, text_digest: str, *, expires_at: str | None = None) -> dict[str, Any]:
-        purpose = choice(purpose, "授权用途", {"clinical_care", "aesthetic_procedure", "weight_program", "followup_contact", "data_export"})
-        if not isinstance(revision, int) or revision < 1:
-            raise ValidationError("授权版本必须为正整数")
-        if len(text_digest) != 64 or any(c not in "0123456789abcdef" for c in text_digest):
-            raise ValidationError("授权文本摘要必须为 SHA-256")
+                      *, document_id: str | None = None, language: str | None = None,
+                      expires_at: str | None = None) -> dict[str, Any]:
+        """按已发布文本签署授权，留存文本版本、语言、正文校验值与签署时间。"""
+        purpose = choice(purpose, "授权用途", CONSENT_PURPOSES)
         now = self.now()
         expires = timestamp(expires_at, "到期时间") if expires_at else None
         if expires and parsed_timestamp(expires) <= parsed_timestamp(now):
@@ -289,23 +404,39 @@ class Careflow:
                 raise NotFound("患者不存在")
             if patient["state"] != "active":
                 raise Conflict("已合并或关闭的患者不能签署新授权")
+            document = self._resolve_consent_document(connection, clinic_id, purpose, document_id, language)
             previous = connection.execute(
                 "SELECT * FROM consents WHERE patient_id=? AND purpose=? ORDER BY revision DESC LIMIT 1", (patient_id, purpose)
             ).fetchone()
-            if previous and revision <= previous["revision"]:
-                raise Conflict("新授权版本必须高于当前版本")
+            revision = previous["revision"] + 1 if previous else 1
             if previous and previous["state"] == "granted":
-                connection.execute("UPDATE consents SET state='expired' WHERE id=?", (previous["id"],))
-            connection.execute(
-                "INSERT INTO consents(id,patient_id,purpose,revision,text_digest,state,effective_at,expires_at,recorded_by,supersedes,created_at) "
-                "VALUES(?,?,?,?,?,'granted',?,?,?,?,?)",
-                (consent_id, patient_id, purpose, revision, text_digest, now, expires, actor_id,
-                 previous["id"] if previous else None, now))
+                # 条件更新：并发撤回等先发生的决定不得被本次签署静默改写。
+                changed = connection.execute(
+                    "UPDATE consents SET state='expired' WHERE id=? AND state='granted'", (previous["id"],)).rowcount
+                if not changed:
+                    raise Conflict("现有授权状态已被其他操作更新，请刷新后重试")
+            try:
+                connection.execute(
+                    "INSERT INTO consents(id,patient_id,purpose,revision,text_digest,state,effective_at,expires_at,"
+                    "recorded_by,supersedes,created_at,document_id,document_version,language,signed_at,covers_json) "
+                    "VALUES(?,?,?,?,?,'granted',?,?,?,?,?,?,?,?,?,?)",
+                    (consent_id, patient_id, purpose, revision, document["body_sha256"], now, expires, actor_id,
+                     previous["id"] if previous else None, now, document["id"], document["version"],
+                     document["language"], now, document["covers_json"]))
+            except sqlite3.IntegrityError as exc:
+                raise Conflict("授权记录与现有数据冲突，请刷新后重试") from exc
             audit.append_event(connection, clinic_id=clinic_id, actor_id=actor_id, patient_id=patient_id,
                                aggregate_type="consent", aggregate_id=consent_id, action="consent.granted",
-                               occurred_at=now, payload={"purpose": purpose, "revision": revision, "digest": text_digest})
+                               occurred_at=now, payload={"purpose": purpose, "revision": revision,
+                                                         "document_id": document["id"],
+                                                         "document_version": document["version"],
+                                                         "language": document["language"],
+                                                         "digest": document["body_sha256"]})
         return {"id": consent_id, "patient_id": patient_id, "purpose": purpose, "revision": revision,
-                "text_digest": text_digest, "state": "granted", "effective_at": now, "expires_at": expires}
+                "document_id": document["id"], "document_version": document["version"],
+                "language": document["language"], "text_digest": document["body_sha256"],
+                "covers": decode_json(document["covers_json"]), "state": "granted",
+                "signed_at": now, "effective_at": now, "expires_at": expires}
 
     def withdraw_consent(self, clinic_id: str, actor_id: str, consent_id: str, reason: str) -> dict[str, Any]:
         reason = text(reason, "撤回原因", maximum=600)
@@ -318,13 +449,19 @@ class Careflow:
             if row is None:
                 raise NotFound("授权不存在")
             if row["state"] == "withdrawn":
-                return {"id": consent_id, "state": "withdrawn", "withdrawn_at": now, "replayed": True}
+                return {"id": consent_id, "state": "withdrawn",
+                        "withdrawn_at": row["withdrawn_at"] or now, "replayed": True}
             if row["state"] != "granted":
                 raise Conflict("只有当前有效授权可以撤回")
-            connection.execute("UPDATE consents SET state='withdrawn' WHERE id=?", (consent_id,))
+            changed = connection.execute(
+                "UPDATE consents SET state='withdrawn',withdrawn_at=? WHERE id=? AND state='granted'",
+                (now, consent_id)).rowcount
+            if not changed:
+                raise Conflict("授权状态已被其他操作更新，请刷新后重试")
             audit.append_event(connection, clinic_id=clinic_id, actor_id=actor_id, patient_id=row["patient_id"],
                                aggregate_type="consent", aggregate_id=consent_id, action="consent.withdrawn",
-                               occurred_at=now, payload={"purpose": row["purpose"], "reason": reason})
+                               occurred_at=now, payload={"purpose": row["purpose"], "revision": row["revision"],
+                                                         "reason": reason})
             self._pause_plans_for_withdrawal(connection, row, now, actor_id)
         return {"id": consent_id, "state": "withdrawn", "withdrawn_at": now, "replayed": False}
 
@@ -343,6 +480,17 @@ class Careflow:
                                occurred_at=now, payload={"consent_id": consent["id"], "previous_version": plan["version"]})
         return len(rows)
 
+    @staticmethod
+    def _consent_result(row) -> dict[str, Any]:
+        return {"id": row["id"], "patient_id": row["patient_id"], "purpose": row["purpose"],
+                "revision": row["revision"], "document_id": row["document_id"],
+                "document_version": row["document_version"], "language": row["language"],
+                "text_digest": row["text_digest"],
+                "covers": decode_json(row["covers_json"]) if row["covers_json"] else None,
+                "state": row["state"], "signed_at": row["signed_at"], "effective_at": row["effective_at"],
+                "expires_at": row["expires_at"], "withdrawn_at": row["withdrawn_at"],
+                "recorded_by": row["recorded_by"], "supersedes": row["supersedes"], "created_at": row["created_at"]}
+
     def consent_history(self, clinic_id: str, actor_id: str, patient_id: str, purpose: str | None = None) -> list[dict[str, Any]]:
         with self.db.transaction(write=False) as connection:
             authorize(principal_for(connection, actor_id, clinic_id), "consent:read", clinic_id=clinic_id)
@@ -352,7 +500,57 @@ class Careflow:
                 rows = connection.execute("SELECT * FROM consents WHERE patient_id=? AND purpose=? ORDER BY revision", (patient_id, purpose)).fetchall()
             else:
                 rows = connection.execute("SELECT * FROM consents WHERE patient_id=? ORDER BY purpose,revision", (patient_id,)).fetchall()
-            return [dict(row) for row in rows]
+            return [self._consent_result(row) for row in rows]
+
+    def check_consent_coverage(self, clinic_id: str, actor_id: str, patient_id: str, purpose: str,
+                               items: list[str] | None = None) -> dict[str, Any]:
+        """复诊时判断现有授权是否仍覆盖拟开展项目，返回明确状态。"""
+        purpose = choice(purpose, "授权用途", CONSENT_PURPOSES)
+        proposed = normalize_items(items or [], "拟开展项目")
+        now = self.now()
+        with self.db.transaction(write=False) as connection:
+            authorize(principal_for(connection, actor_id, clinic_id), "consent:read", clinic_id=clinic_id)
+            if connection.execute("SELECT 1 FROM patients WHERE id=? AND clinic_id=?", (patient_id, clinic_id)).fetchone() is None:
+                raise NotFound("患者不存在")
+            consent = connection.execute(
+                "SELECT * FROM consents WHERE patient_id=? AND purpose=? ORDER BY revision DESC LIMIT 1",
+                (patient_id, purpose)).fetchone()
+            result: dict[str, Any] = {"patient_id": patient_id, "purpose": purpose,
+                                      "proposed_items": proposed, "checked_at": now,
+                                      "consent_id": None, "status": "missing"}
+            if consent is None:
+                return result
+            result.update(consent_id=consent["id"], document_version=consent["document_version"],
+                          language=consent["language"], signed_at=consent["signed_at"])
+            if consent["state"] == "withdrawn":
+                result.update(status="withdrawn", withdrawn_at=consent["withdrawn_at"])
+                return result
+            if consent["state"] == "expired":
+                result["status"] = "expired"
+                return result
+            if consent["expires_at"] and parsed_timestamp(consent["expires_at"]) <= parsed_timestamp(now):
+                result.update(status="expired", expires_at=consent["expires_at"])
+                return result
+            if consent["document_id"]:
+                resign_from = connection.execute(
+                    "SELECT MAX(version) FROM consent_documents "
+                    "WHERE clinic_id=? AND purpose=? AND language=? AND requires_resign=1",
+                    (clinic_id, purpose, consent["language"])).fetchone()[0]
+                if resign_from and consent["document_version"] and resign_from > consent["document_version"]:
+                    latest = connection.execute(
+                        "SELECT id,version FROM consent_documents WHERE clinic_id=? AND purpose=? AND language=? "
+                        "ORDER BY version DESC LIMIT 1",
+                        (clinic_id, purpose, consent["language"])).fetchone()
+                    result.update(status="resign_required", signed_version=consent["document_version"],
+                                  latest_version=latest["version"], latest_document_id=latest["id"])
+                    return result
+            covers = set(decode_json(consent["covers_json"])) if consent["covers_json"] else set()
+            missing_items = [item for item in proposed if item not in covers]
+            if missing_items:
+                result.update(status="scope_expanded", missing_items=missing_items)
+                return result
+            result.update(status="covered", expires_at=consent["expires_at"])
+            return result
 
     def create_assessment(self, clinic_id: str, actor_id: str, patient_id: str, kind: str,
                           measurements: dict, answers: dict, *, source: str = "clinician") -> dict[str, Any]:

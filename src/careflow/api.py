@@ -125,11 +125,33 @@ def create_handler(app: Careflow):
                                           expected_source=data.get("expected_source", 0),
                                           expected_target=data.get("expected_target", 0),
                                           reason=data.get("reason", "")), 200
+            if self.command == "POST" and segments == ["consent-documents"]:
+                data = self.body()
+                return app.publish_consent_document(clinic_id, actor_id, data.get("purpose", ""),
+                                                    data.get("language", ""), data.get("version", 0),
+                                                    data.get("body", ""), data.get("covers"),
+                                                    requires_resign=data.get("requires_resign", False)), 201
+            if self.command == "GET" and segments == ["consent-documents"]:
+                params = parse_qs(path.query)
+                return {"items": app.list_consent_documents(clinic_id, actor_id,
+                                                            purpose=params.get("purpose", [None])[0],
+                                                            language=params.get("language", [None])[0])}, 200
+            if len(segments) == 2 and segments[0] == "consent-documents" and self.command == "GET":
+                return app.get_consent_document(clinic_id, actor_id, segments[1]), 200
             if len(segments) == 3 and segments[0] == "patients" and segments[2] == "consents" and self.command == "POST":
                 data = self.body()
                 return app.grant_consent(clinic_id, actor_id, segments[1], data.get("purpose", ""),
-                                         data.get("revision", 0), data.get("text_digest", ""),
+                                         document_id=data.get("document_id"), language=data.get("language"),
                                          expires_at=data.get("expires_at")), 201
+            if len(segments) == 3 and segments[0] == "patients" and segments[2] == "consents" and self.command == "GET":
+                params = parse_qs(path.query)
+                return {"items": app.consent_history(clinic_id, actor_id, segments[1],
+                                                     params.get("purpose", [None])[0])}, 200
+            if len(segments) == 3 and segments[0] == "patients" and segments[2] == "consent-coverage" and self.command == "GET":
+                params = parse_qs(path.query)
+                proposed = [item for item in params.get("items", [""])[0].split(",") if item.strip()]
+                return app.check_consent_coverage(clinic_id, actor_id, segments[1],
+                                                  params.get("purpose", [""])[0], items=proposed), 200
             if len(segments) == 4 and segments[0] == "consents" and segments[2] == "withdraw" and self.command == "POST":
                 return app.withdraw_consent(clinic_id, actor_id, segments[1], self.body().get("reason", "")), 200
             if len(segments) == 3 and segments[0] == "patients" and segments[2] == "assessments" and self.command == "POST":
